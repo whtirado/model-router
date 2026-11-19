@@ -1,5 +1,6 @@
 {
   "name": "local-mods",
-  "owner": { "name": "lifeb" },
+  "description": "Local plugins by whtirado.",
+  "owner": { "name": "whtirado" },
   "plugins": [{ "name": "model-router", "source": "./" }]
 }
