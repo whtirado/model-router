@@ -6,7 +6,7 @@
   "author": {
     "name": "whtirado"
   },
-  "icon": "./icon.png",
+  "icon": "./.claude-plugin/icon.png",
   "types": "./types/index.d.ts",
   "userConfig": {
     "cacheTtl": {
