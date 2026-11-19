@@ -1,0 +1,5 @@
+{
+  "name": "local-mods",
+  "owner": { "name": "lifeb" },
+  "plugins": [{ "name": "model-router", "source": "./" }]
+}
