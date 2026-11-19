@@ -185,8 +185,9 @@ export function subagentChoice(main: RouterChoice, subagentType: string): { mode
       : type === 'plan'
         ? { model: main.model, effort: main.effort }
         : { model: 'sonnet', effort: 'medium' }
-  const model = MODEL_NAMES[Math.min(MODEL_NAMES.indexOf(wanted.model), MODEL_NAMES.indexOf(main.model))] ?? wanted.model
-  const effort = EFFORTS[Math.min(EFFORTS.indexOf(wanted.effort), EFFORTS.indexOf(main.effort))] ?? wanted.effort
+  // Both indexes are of names in the lists, so the lower one is too.
+  const model = MODEL_NAMES[Math.min(MODEL_NAMES.indexOf(wanted.model), MODEL_NAMES.indexOf(main.model))]!
+  const effort = EFFORTS[Math.min(EFFORTS.indexOf(wanted.effort), EFFORTS.indexOf(main.effort))]!
   return { model, effort }
 }
 
@@ -414,11 +415,7 @@ export function dollars(n: number): string {
   return `$${n.toFixed(2)}`
 }
 
-function count(n: number): string {
-  return n.toLocaleString('en-US')
-}
-
-function pad(text: string, width: number, align: 'left' | 'right' = 'left'): string {
+function pad(text: string, width: number, align: 'left' | 'right'): string {
   if (text.length >= width) return text
   const fill = ' '.repeat(width - text.length)
   return align === 'left' ? text + fill : fill + text
@@ -431,17 +428,17 @@ function rowLabel(row: RouterUsageRow): string {
   return label
 }
 
-export function formatTable(rows: RouterUsageRow[], total: number, options: { title: string; footer?: string }): string {
+export function formatTable(rows: RouterUsageRow[], total: number, title: string): string {
   const header = ['Model', 'Effort', 'Cost']
   const lines = rows.map(row => [rowLabel(row), row.effort, dollars(row.cost)])
   const totalLine = ['Total', '', dollars(total)]
   const all = [header, ...lines, totalLine]
-  const widths = header.map((_, i) => Math.max(...all.map(line => (line[i] ?? '').length)))
-  const render = (line: string[]) => line.map((cell, i) => pad(cell, widths[i] ?? 0, i === 2 ? 'right' : 'left')).join('  ')
-  const out = [options.title, render(header), render(widths.map(w => '-'.repeat(w)))]
+  // Every line has the header's three cells, so each index below is in range.
+  const widths = header.map((_, i) => Math.max(...all.map(line => line[i]!.length)))
+  const render = (line: string[]) => line.map((cell, i) => pad(cell, widths[i]!, i === 2 ? 'right' : 'left')).join('  ')
+  const out = [title, render(header), render(widths.map(w => '-'.repeat(w)))]
   for (const line of lines) out.push(render(line))
   out.push(render(totalLine))
-  if (options.footer) out.push(options.footer)
   return out.join('\n')
 }
 
@@ -523,7 +520,7 @@ export const register: Register = (on, options) => {
     const choice = await read($, pending)
     await update($, pending, () => null)
     await update($, current, () => choice)
-    const startedAt = Date.now()
+    const startedAt = await $.clock.now()
     const task: Task = {
       rows: new Map(),
       startedAt,
@@ -565,7 +562,7 @@ export const register: Register = (on, options) => {
       scope = 'task'
       let choice = await read($, current)
       if (task) {
-        const now = Date.now()
+        const now = await $.clock.now()
         if (choice && task.checks < LONG_TASK_MAX_CHECKS && (task.steps >= task.nextCheckStep || now >= task.nextCheckAt)) {
           task.checks++
           task.nextCheckStep = task.steps + LONG_TASK_STEPS
@@ -606,9 +603,8 @@ export const register: Register = (on, options) => {
   // 3b. Count the task's failed tool calls, and hand Claude the long-task note with its next tool result.
   on('tool.call', async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId !== undefined || runningMain === undefined) return result
-    const task = tasks.get(runningMain)
-    if (!task) return result
+    const task = runningMain === undefined ? undefined : tasks.get(runningMain)
+    if (e.agentId !== undefined || !task) return result
     if (result.isError) task.toolErrors++
     if (task.note && result.deny === undefined) {
       const note = task.note
@@ -625,24 +621,23 @@ export const register: Register = (on, options) => {
       return next(e)
     }
     const task = tasks.get(e.turnId)
+    // A turn the router never saw start is not its to close.
+    if (!task) return next(e)
     tasks.delete(e.turnId)
     if (runningMain === e.turnId) runningMain = undefined
     await update($, current, () => null)
     $.ui.status(undefined)
-    if (!task) return next(e)
 
     const rows = sortRows(task.rows.values())
     const total = rows.reduce((n, r) => n + r.cost, 0)
     const report: RouterTaskReport = { turnId: e.turnId, rows, total }
     await update($, last, () => report)
-    const session = await update($, sessionTally, t => foldReport(t, report))
-    let allTime: RouterTally | undefined
+    await update($, sessionTally, t => foldReport(t, report))
     try {
       const stored = (await $.store.get(ALL_TIME_KEY)) as RouterTally | undefined
-      allTime = foldReport(stored ?? emptyTally(), report)
-      await $.store.set(ALL_TIME_KEY, allTime)
+      await $.store.set(ALL_TIME_KEY, foldReport(stored ?? emptyTally(), report))
     } catch {
-      allTime = undefined
+      // The all-time tally is best effort; the session tally above already has the task.
     }
 
     for (const row of rows) {
@@ -691,15 +686,15 @@ export const register: Register = (on, options) => {
       } catch {
         allTime = undefined
       }
-      const parts = [formatTable(sortRows(Object.values(session.rows)), session.total, { title: `This session: ${session.tasks} task(s)` })]
-      if (allTime) parts.push('', formatTable(sortRows(Object.values(allTime.rows)), allTime.total, { title: `All time: ${allTime.tasks} task(s)` }))
+      const parts = [formatTable(sortRows(Object.values(session.rows)), session.total, `This session: ${session.tasks} task(s)`)]
+      if (allTime) parts.push('', formatTable(sortRows(Object.values(allTime.rows)), allTime.total, `All time: ${allTime.tasks} task(s)`))
       parts.push(`API-equivalent at ${PRICES_DATED} rates, ${cacheTtl} cache.`)
       return { text: parts.join('\n') }
     }
     if (verb === 'last') {
       const report = await read($, last)
       if (!report) return { text: 'No task has finished yet.' }
-      return { text: formatTable(report.rows, report.total, { title: `Last task: ${dollars(report.total)}` }) }
+      return { text: formatTable(report.rows, report.total, `Last task: ${dollars(report.total)}`) }
     }
     if (verb === 'reset') {
       await update($, sessionTally, () => emptyTally())

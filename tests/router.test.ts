@@ -1,12 +1,13 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { TurnStepInput, TurnUsage } from 'claude-code'
 
 /** What the session's transcript holds, as `$.session.messages()` reads it. */
 let history: { role: 'user' | 'assistant'; text: string; toolUses: never[] }[] = []
 
-type Reply = string | { fail: true }
+/** What the classifier answers: a text, no answer, or an error. */
+type Reply = string | { fail: true } | { throws: true }
 type Seen = {
   steps: TurnStepInput[]
   logs: string[]
@@ -17,8 +18,20 @@ type Seen = {
   setReply: (reply: Reply) => void
   /** The hidden context each prompt entered with. */
   contexts: (readonly string[] | undefined)[]
+  /** The engine's clock, which moves only when a test moves it. */
+  clock: MockClock
   /** Makes every tool call fail while true. */
   failTools: boolean
+  /** Makes every tool call refused while true. */
+  denyTools: boolean
+  /** Hidden context every tool result already carries. */
+  toolContext: string[] | undefined
+  /** Makes every subagent spawn refused while true. */
+  denySpawn: boolean
+  /** Makes model requests answer without usage while true. */
+  noUsage: boolean
+  /** Makes reading the transcript throw while true. */
+  failMessages: boolean
 }
 
 const USAGE_1K: Omit<TurnUsage, 'model'> = {
@@ -29,7 +42,8 @@ const USAGE_1K: Omit<TurnUsage, 'model'> = {
 }
 
 /** The world beneath the mod: a classifier that answers `reply`, a model that answers every step, and a log. */
-function engine(on: On, reply: Reply): Seen {
+function engine(on: On, reply: Reply, options: { brokenStore?: boolean } = {}): Seen {
+  const clock = mock.clock(on)
   const seen: Seen = {
     steps: [],
     logs: [],
@@ -39,12 +53,30 @@ function engine(on: On, reply: Reply): Seen {
       reply = next
     },
     contexts: [],
+    clock,
     failTools: false,
+    denyTools: false,
+    toolContext: undefined,
+    denySpawn: false,
+    noUsage: false,
+    failMessages: false,
   }
   let spawned = 0
   history = []
-  mock.store(on)
-  on('session.messages', () => ({ value: history as never }))
+  if (options.brokenStore) {
+    const broken = (): never => {
+      throw new Error('store unavailable')
+    }
+    on('store.get', broken)
+    on('store.set', broken)
+    on('store.delete', broken)
+  } else {
+    mock.store(on)
+  }
+  on('session.messages', () => {
+    if (seen.failMessages) throw new Error('transcript unavailable')
+    return { value: history as never }
+  })
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.log', (_, e) => {
     seen.logs.push(e.text)
@@ -56,27 +88,35 @@ function engine(on: On, reply: Reply): Seen {
   })
   on('model.complete', (_, e) => {
     seen.prompts.push(e.prompt)
+    if (typeof reply === 'object' && 'throws' in reply) throw new Error('model unavailable')
     return {
-    value:
-      typeof reply === 'string'
-        ? { isAnswered: true as const, text: reply, usage: { input_tokens: 400, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }
-        : { isAnswered: false as const, reason: 'aborted' as const, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+      value:
+        typeof reply === 'string'
+          ? { isAnswered: true as const, text: reply, usage: { input_tokens: 400, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }
+          : { isAnswered: false as const, reason: 'aborted' as const, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
     }
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => {
     seen.contexts.push(e.context)
-    return { text: e.text }
+    return { text: e.text ?? '' }
   })
-  on('agent.spawn', (_, e) => ({ model: e.model ?? e.parentModel, agentId: `sub-${++spawned}` }))
+  on('agent.spawn', (_, e) => {
+    if (seen.denySpawn) return { deny: 'not allowed' } as never
+    return { model: e.model ?? e.parentModel, agentId: `sub-${++spawned}` }
+  })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* (_, e) {
     seen.steps.push(e)
-    const usage: TurnUsage = { ...USAGE_1K, model: e.model }
-    yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage }
+    const usage = seen.noUsage ? null : ({ ...USAGE_1K, model: e.model } as TurnUsage)
+    yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage } as never
     return { turnId: e.turnId, index: e.index, answer: 'done', toolUses: [], stopReason: 'end_turn' as const, usage }
   })
-  on('tool.call', () => (seen.failTools ? { result: 'boom', text: 'boom', isError: true } : { result: 'ok', text: 'ok' }) as never)
+  on('tool.call', () => {
+    if (seen.denyTools) return { deny: 'denied' } as never
+    const context = seen.toolContext ? { context: seen.toolContext } : {}
+    return (seen.failTools ? { result: 'boom', text: 'boom', isError: true, ...context } : { result: 'ok', text: 'ok', ...context }) as never
+  })
   on('turn.complete', (_, e) => ({ text: e.answer }))
   return seen
 }
@@ -365,4 +405,262 @@ test('a pinned session keeps its model and effort through a long task', async ($
   expect(seen.logs).toContain('Router: long task (25 steps, under 1 min) · kept Opus 5.5 · high effort · stuck (classifier)')
   const after = await $.tool.call(READ)
   expect(after.context).toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
+// Options, edge cases and failures
+// ---------------------------------------------------------------------------
+
+const PRESENT = { layout: 'main', columns: 80 } as never
+const route = async ($: Engine, args: string) =>
+  (await $.command.run({ command: 'route', args, origin: { kind: 'composer' }, presentation: PRESENT })).text
+
+test('a 5-minute cache option prices cache writes at the 5-minute rate', { options: { cacheTtl: '5m' } }, async ($, on) => {
+  const seen = engine(on, '{"model":"opus","effort":"high","reason":"x"}')
+  on('command.run', (_, e) => ({ text: `unhandled ${e.command}` }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await task($, 'refactor the auth module', 'turn-60')
+
+  // 1000 x $4 + 500 x $20 + 10,000 x $0.20 + 2000 x $5 (5m cache write) = $26,000 per million.
+  expect(seen.logs).toContain('Opus 5.5 - High [in tokens 13000] [out tokens 500] $0.026')
+  expect(await route($, 'stats')).toMatch(/5m cache\.$/)
+})
+
+test('meta, empty and mid-turn prompts are not routed', async ($, on) => {
+  const seen = engine(on, '{"model":"haiku","effort":"low","reason":"x"}')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'a reminder', isMeta: true, origin: { kind: 'composer' }, wait: false } as never)
+  await $.prompt.submit({ text: '   ', origin: { kind: 'composer' }, wait: false } as never)
+  await $.prompt.submit({ text: 'and also this', turnId: 'turn-61', origin: { kind: 'composer' }, wait: false } as never)
+
+  expect(seen.prompts).toHaveLength(0)
+  expect(seen.logs).toHaveLength(0)
+})
+
+test('a prompt the router cannot handle still goes through unrouted', async ($, on) => {
+  const seen = engine(on, '{"model":"haiku","effort":"low","reason":"x"}')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  // No text at all: the router's own check throws, and its .catch passes the prompt on.
+  await $.prompt.submit({ origin: { kind: 'composer' }, wait: false } as never)
+
+  expect(seen.contexts).toHaveLength(1)
+  expect(seen.logs).toHaveLength(0)
+})
+
+test('/route covers every command: last, model-only pins, status, on, auto, off and bad input', async ($, on) => {
+  const seen = engine(on, '{"model":"opus","effort":"high","reason":"careful work"}')
+  on('command.run', (_, e) => ({ text: `unhandled ${e.command}` }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(await route($, 'last')).toBe('No task has finished yet.')
+  expect(await route($, 'sonnet')).toBe('Pinned to Sonnet 5.5 (effort still classified) for this session. /route auto to unpin.')
+  expect(await route($, 'sonnet extreme')).toBe('Unknown effort "extreme": use low, medium or high.')
+
+  // A model-only pin keeps the classifier's effort.
+  await $.prompt.submit({ text: 'review the payment flow', origin: { kind: 'composer' }, wait: false } as never)
+  expect(seen.logs).toContain('Router: Sonnet 5.5 · high effort · /route pin; careful work (pinned)')
+  expect(await route($, 'status')).toBe('Router is pinned to Sonnet 5.5; next: Sonnet 5.5 · high effort · /route pin; careful work (pinned).')
+
+  await $.turn.start({ text: 'review the payment flow', turnId: 'turn-62' } as never)
+  expect(await route($, 'on')).toBe('Router on: each prompt is classified.')
+  expect(await route($, 'auto')).toBe('Router on: each prompt is classified.')
+  expect(await route($, '')).toBe('Router is auto; running on Sonnet 5.5 · high effort · /route pin; careful work (pinned).')
+  await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: false, turnId: 'turn-62', reason: 'answer' } as never)
+
+  await route($, 'off')
+  expect(await route($, 'status')).toBe('Router is off; idle.')
+  expect(await route($, 'everything please')).toMatch(/^Usage: \/route/)
+})
+
+test('/route reset clears the session and all-time tallies', async ($, on) => {
+  engine(on, '{"model":"sonnet","effort":"low","reason":"quick"}')
+  on('command.run', (_, e) => ({ text: `unhandled ${e.command}` }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await task($, 'first', 'turn-63')
+  expect(await route($, 'stats')).toMatch(/All time: 1 task\(s\)/)
+
+  expect(await route($, 'reset')).toBe('Router tallies reset.')
+  const stats = await route($, 'stats')
+  expect(stats).toMatch(/This session: 0 task\(s\)/)
+  expect(stats).not.toMatch(/All time/)
+})
+
+test('a store that fails leaves the session tally and the end-of-task lines working', async ($, on) => {
+  const seen = engine(on, '{"model":"sonnet","effort":"low","reason":"quick"}', { brokenStore: true })
+  on('command.run', (_, e) => ({ text: `unhandled ${e.command}` }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await task($, 'first', 'turn-64')
+
+  expect(seen.logs.some(line => line.startsWith('Sonnet 5.5 - Low [in tokens 13000]'))).toBe(true)
+  const stats = await route($, 'stats')
+  expect(stats).toMatch(/This session: 1 task\(s\)/)
+  expect(stats).not.toMatch(/All time/)
+  expect(await route($, 'reset')).toBe('Router tallies reset.')
+})
+
+test('the classifier gets long messages trimmed, long prompts cut and attachments counted', async ($, on) => {
+  const seen = engine(on, '{"model":"sonnet","effort":"medium","reason":"x"}')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  history.push({ role: 'assistant', text: 'y'.repeat(800), toolUses: [] })
+
+  await $.prompt.submit({ text: 'z'.repeat(7000), attachments: [{ type: 'image' }], origin: { kind: 'composer' }, wait: false } as never)
+
+  expect(seen.prompts[0]).toContain(`Assistant: ${'y'.repeat(700)} [...]`)
+  expect(seen.prompts[0]).toContain('[... 1000 more characters]')
+  expect(seen.prompts[0]).toContain('New prompt to route [1 attachment(s)]:')
+})
+
+test('an unreadable answer, a classifier that throws and a transcript that fails all fall back to the rules', async ($, on) => {
+  const seen = engine(on, 'I think sonnet would be best')
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await task($, 'what time is it', 'turn-65')
+  expect(seen.logs).toContain('Router: Haiku 5.5 · low effort · rules: short prompt (rules)')
+
+  seen.setReply({ throws: true })
+  seen.failMessages = true
+  await task($, 'fix the crash when saving', 'turn-66')
+  expect(seen.logs).toContain('Router: Opus 5.5 · medium effort · rules: debugging keywords (rules)')
+  // A classifier that threw cost nothing, so no router line follows that task.
+  const after = seen.logs.slice(seen.logs.indexOf('Router: Opus 5.5 · medium effort · rules: debugging keywords (rules)'))
+  expect(after.some(line => line.includes('(router)'))).toBe(false)
+})
+
+test('a large task keeps hidden context the prompt already carried', async ($, on) => {
+  const seen = engine(on, '{"model":"opus","effort":"high","size":"large","reason":"big"}')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  await $.prompt.submit({ text: 'migrate every service', context: ['earlier note'], origin: { kind: 'composer' }, wait: false } as never)
+
+  expect(seen.contexts[0]?.[0]).toBe('earlier note')
+  expect(seen.contexts[0]?.[1]).toContain('[model-router] This task looks large')
+})
+
+test('a long task is also checked by time, at most three times', async ($, on) => {
+  const seen = engine(on, '{"model":"sonnet","effort":"medium","reason":"x"}')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'port the sync engine', origin: { kind: 'composer' }, wait: false } as never)
+  await $.turn.start({ text: 'port the sync engine', turnId: 'turn-67' } as never)
+  seen.setReply('{"escalate":"none","subagents":false,"reason":"steady progress"}')
+
+  for (let index = 0; index < 4; index++) {
+    await seen.clock.advance(6 * 60_000)
+    await steps($, 'turn-67', index, index + 1)
+  }
+
+  expect(seen.prompts).toHaveLength(4)
+  expect(seen.logs).toContain('Router: long task (0 steps, 6 min) · kept Sonnet 5.5 · medium effort · steady progress (classifier)')
+  expect(seen.logs).toContain('Router: long task (2 steps, 18 min) · kept Sonnet 5.5 · medium effort · steady progress (classifier)')
+})
+
+test('a check that cannot reach the model uses the rules; a refused tool call keeps the note for the next', async ($, on) => {
+  const seen = engine(on, '{"model":"sonnet","effort":"medium","reason":"x"}')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  history.push({ role: 'user', text: 'port the sync engine', toolUses: [] })
+  await $.prompt.submit({ text: 'port the sync engine', origin: { kind: 'composer' }, wait: false } as never)
+  await $.turn.start({ text: 'port the sync engine', turnId: 'turn-68' } as never)
+  seen.setReply({ throws: true })
+
+  await steps($, 'turn-68', 0, 26)
+  expect(seen.prompts[1]).toContain('Recent conversation')
+  expect(seen.logs).toContain('Router: long task (25 steps, under 1 min) · kept Sonnet 5.5 · medium effort · suggested subagents · rules: long but progressing (rules)')
+
+  seen.denyTools = true
+  const refused = await $.tool.call(READ)
+  expect(refused.context).toBeUndefined()
+  seen.denyTools = false
+  seen.toolContext = ['another hint']
+  const next = await $.tool.call(READ)
+  expect(next.context?.[0]).toBe('another hint')
+  expect(next.context?.[1]).toContain('[model-router] This task has made 25 steps')
+
+  await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: false, turnId: 'turn-68', reason: 'answer' } as never)
+  // Only the routing call is priced; the check that threw cost nothing.
+  expect(seen.logs).toContain('Haiku 5.5 (router) - Low [in tokens 400] [out tokens 30] $0.0001')
+})
+
+test('with the router off, a long task is never checked', async ($, on) => {
+  const seen = engine(on, '{"model":"haiku","effort":"low","reason":"x"}')
+  on('command.run', (_, e) => ({ text: `unhandled ${e.command}` }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  await route($, 'off')
+  await task($, 'anything', 'turn-69', 26)
+
+  expect(seen.prompts).toHaveLength(0)
+  expect(seen.steps.every(s => s.model === 'claude-opus-5-5' && s.effort === 'high')).toBe(true)
+})
+
+test('subagents, steps and tool calls outside a routed task pass through untouched', async ($, on) => {
+  const seen = engine(on, '{"model":"opus","effort":"high","reason":"x"}')
+  const base = { tool_use_id: 't', prompt: 'p', description: 'd', subagentType: 'general-purpose', provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-opus-5-5', background: false, fork: false }
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  // No task is running: the spawn keeps its model, the subagent's turn has no parent.
+  const loose = await $.agent.spawn(base as never)
+  expect(loose.model).toBe('claude-opus-5-5')
+  await $.turn.start({ text: 'p', turnId: 'orphan', agentId: 'sub-x' } as never)
+  await drain($.turn.step({ turnId: 'orphan', index: 0, model: 'claude-sonnet-5-5', effort: 'high', messageCount: 1, agentId: 'sub-x' } as never))
+  expect(seen.steps[0]?.effort).toBe('high')
+  await $.turn.complete({ answer: 'x', durationMs: 1, isAborted: false, turnId: 'orphan', agentId: 'sub-x', reason: 'answer' } as never)
+  // A main-loop step of a turn the router never saw start.
+  await drain($.turn.step({ turnId: 'ghost', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 1 } as never))
+  expect(seen.steps[1]?.model).toBe('claude-opus-5-5')
+  const tool = await $.tool.call(READ)
+  expect(tool.context).toBeUndefined()
+
+  // Inside a task: a refused spawn, a spawn the router cannot read, a step without usage, a subagent step without effort.
+  await $.prompt.submit({ text: 'big job', origin: { kind: 'composer' }, wait: false } as never)
+  await $.turn.start({ text: 'big job', turnId: 'turn-70' } as never)
+  seen.denySpawn = true
+  const refused = await $.agent.spawn(base as never)
+  expect(refused.deny).toBe('not allowed')
+  seen.denySpawn = false
+  // A spawn the router cannot read (no subagent type) makes its hook throw; its .catch passes the spawn on.
+  const unread = await $.agent.spawn({ ...base, subagentType: undefined } as never)
+  expect(unread.model).toBe('claude-opus-5-5')
+
+  seen.noUsage = true
+  await drain($.turn.step({ turnId: 'turn-70', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 1 } as never))
+  seen.noUsage = false
+  await $.turn.start({ text: 'p', turnId: 'sub-turn-70', agentId: 'sub-zz' } as never)
+  await drain($.turn.step({ turnId: 'sub-turn-70', index: 0, model: 'claude-opus-5-5', messageCount: 1, agentId: 'sub-zz' } as never))
+
+  // Another turn's end leaves this one running.
+  await $.turn.complete({ answer: 'x', durationMs: 1, isAborted: false, turnId: 'elsewhere', reason: 'answer' } as never)
+  await $.turn.complete({ answer: 'done', durationMs: 10, isAborted: false, turnId: 'turn-70', reason: 'answer' } as never)
+
+  expect(seen.logs).toContain('Opus 5.5 (subagent) - Default [in tokens 13000] [out tokens 500] $0.032')
+  expect(seen.logs.some(line => line.startsWith('Opus 5.5 - High'))).toBe(false)
+})
+
+/** Reads a step's stream to its end. */
+async function drain(stream: AsyncIterable<unknown>) {
+  for await (const _chunk of stream) {
+    // drain
+  }
+}
+
+test('a task that ends after a newer one started leaves the newer one running', async ($, on) => {
+  const seen = engine(on, '{"model":"sonnet","effort":"low","reason":"quick"}')
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  await $.prompt.submit({ text: 'first', origin: { kind: 'composer' }, wait: false } as never)
+  await $.turn.start({ text: 'first', turnId: 'turn-71' } as never)
+  await $.prompt.submit({ text: 'second', origin: { kind: 'composer' }, wait: false } as never)
+  await $.turn.start({ text: 'second', turnId: 'turn-72' } as never)
+  await $.turn.complete({ answer: 'x', durationMs: 1, isAborted: false, turnId: 'turn-71', reason: 'answer' } as never)
+
+  // The newer task still collects its failed tool calls.
+  seen.failTools = true
+  await $.tool.call(READ)
+  seen.failTools = false
+  await steps($, 'turn-72', 0, 1)
+  await $.turn.complete({ answer: 'x', durationMs: 1, isAborted: false, turnId: 'turn-72', reason: 'answer' } as never)
+  expect(seen.logs.filter(line => line.startsWith('Haiku 5.5 (router)'))).toHaveLength(2)
 })

@@ -1,7 +1,7 @@
 {
   "name": "model-router",
-  "version": "0.4.0",
-  "description": "Picks a model and effort level for each prompt, announces the choice, and reports tokens and cost when the task ends.",
+  "version": "0.5.0",
+  "description": "Picks the right model and effort level for each task and saves tokens by keeping larger models off simple work. Reports tokens and cost when each task ends.",
   "license": "MIT",
   "author": {
     "name": "whtirado"
