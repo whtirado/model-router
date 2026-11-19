@@ -3,6 +3,10 @@
   "version": "0.4.0",
   "description": "Picks a model and effort level for each prompt, announces the choice, and reports tokens and cost when the task ends.",
   "license": "MIT",
+  "author": {
+    "name": "whtirado"
+  },
+  "icon": "./icon.png",
   "types": "./types/index.d.ts",
   "userConfig": {
     "cacheTtl": {
